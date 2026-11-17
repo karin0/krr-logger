@@ -58,6 +58,8 @@ fn install_stderr(
     timestamp: bool,
 ) -> Result<(), SetLoggerError> {
     let tz = TimeZone::system();
+    // `RUST_LOG_STYLE` stays unread: the automatic write style already follows `NO_COLOR` and
+    // `CLICOLOR_FORCE`.
     env_logger::Builder::new()
         .parse_filters(filter)
         .format(move |f, record| {
