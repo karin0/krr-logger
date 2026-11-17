@@ -17,7 +17,7 @@ fn main() -> Result<(), log::SetLoggerError> {
 
 `RUST_LOG` filters the messages with the [`env_logger` syntax](https://docs.rs/env_logger/latest/env_logger/#enabling-logging). When it is unset, the filter is the argument of `init!`, such as `krr_logger::init!("info,hyper=warn")`, or `info` without one.
 
-Each message starts with its level and the module path of its target. The path is omitted for the root module of the crate that calls `init!`, relative for its submodules, and complete for other crates:
+Each message starts with its level and the module path of its target. The path is omitted for the root module of the crate that calls `init!`, relative for its submodules, and complete for other crates. The library beside `src/main.rs` has the same crate name as the binary, so its paths are relative as well:
 
 ```
 INFO  started
