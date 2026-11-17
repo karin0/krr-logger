@@ -1,11 +1,11 @@
 //! A logger for the [`log`] facade that writes to the systemd journal through its native protocol
 //! when the process runs as a systemd service, and to stderr otherwise.
 
-use std::io::Write;
+use std::{fmt, io::Write};
 
 use env_logger::fmt::style::Style;
-use jiff::{Timestamp, tz::TimeZone};
-use log::SetLoggerError;
+use jiff::{Timestamp, civil::DateTime, tz::TimeZone};
+use log::{Record, SetLoggerError};
 
 /// Installs the global logger, filtered by `RUST_LOG`.
 ///
@@ -42,34 +42,76 @@ pub fn init(crate_name: &'static str, default_filter: &str) -> Result<(), SetLog
         match journal::JournalLogger::new(crate_name, &filter) {
             Ok(logger) => return logger.install(),
             Err(e) => {
-                install_stderr(crate_name, &filter)?;
+                install_stderr(crate_name, &filter, false)?;
                 log::warn!("cannot open the journal socket, writing to stderr: {e}");
                 return Ok(());
             }
         }
     }
 
-    install_stderr(crate_name, &filter)
+    install_stderr(crate_name, &filter, true)
 }
 
-fn install_stderr(crate_name: &'static str, filter: &str) -> Result<(), SetLoggerError> {
+fn install_stderr(
+    crate_name: &'static str,
+    filter: &str,
+    timestamp: bool,
+) -> Result<(), SetLoggerError> {
     let tz = TimeZone::system();
     env_logger::Builder::new()
         .parse_filters(filter)
         .format(move |f, record| {
-            let time = tz
-                .to_datetime(Timestamp::now())
-                .strftime("%Y-%m-%d %H:%M:%S%.3f");
-            let level = record.level();
-            let level_style = f.default_level_style(level);
-            write!(f, "{time} {level_style}{level:<5}{level_style:#} ")?;
-            if let Some(prefix) = module_prefix(crate_name, record.target()) {
-                let bold = Style::new().bold();
-                write!(f, "{bold}{prefix}{bold:#} > ")?;
-            }
-            writeln!(f, "{}", record.args())
+            let line = StderrLine {
+                time: timestamp.then(|| tz.to_datetime(Timestamp::now())),
+                message: Message {
+                    crate_name,
+                    record,
+                    level_style: f.default_level_style(record.level()),
+                    path_style: Style::new().bold(),
+                },
+            };
+            writeln!(f, "{line}")
         })
         .try_init()
+}
+
+/// A line on stderr. journald stamps the lines of a journal stream itself, so they carry no time.
+struct StderrLine<'a> {
+    time: Option<DateTime>,
+    message: Message<'a>,
+}
+
+impl fmt::Display for StderrLine<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(time) = self.time {
+            write!(f, "{} ", time.strftime("%Y-%m-%d %H:%M:%S%.3f"))?;
+        }
+        write!(f, "{}", self.message)
+    }
+}
+
+/// The level, module path and text of a message.
+struct Message<'a> {
+    crate_name: &'a str,
+    record: &'a Record<'a>,
+    level_style: Style,
+    path_style: Style,
+}
+
+impl fmt::Display for Message<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            level_style,
+            path_style,
+            ..
+        } = self;
+        let level = self.record.level();
+        write!(f, "{level_style}{level:<5}{level_style:#} ")?;
+        if let Some(prefix) = module_prefix(self.crate_name, self.record.target()) {
+            write!(f, "{path_style}{prefix}{path_style:#} > ")?;
+        }
+        write!(f, "{}", self.record.args())
+    }
 }
 
 /// Returns the module path written before a message, or `None` for the root module of the
@@ -84,12 +126,11 @@ fn module_prefix<'a>(crate_name: &str, target: &'a str) -> Option<&'a str> {
 
 #[cfg(target_os = "linux")]
 mod journal {
-    use std::fmt;
-
+    use env_logger::fmt::style::Style;
     use log::{Log, Metadata, Record, SetLoggerError};
     use systemd_journal_logger::JournalLog;
 
-    use crate::module_prefix;
+    use crate::Message;
 
     pub struct JournalLogger {
         crate_name: &'static str,
@@ -121,9 +162,11 @@ mod journal {
 
         fn log(&self, record: &Record) {
             if self.filter.matches(record) {
-                let message = JournalMessage {
+                let message = Message {
                     crate_name: self.crate_name,
                     record,
+                    level_style: Style::new(),
+                    path_style: Style::new(),
                 };
                 self.journal
                     .log(&record.to_builder().args(format_args!("{message}")).build());
@@ -132,63 +175,73 @@ mod journal {
 
         fn flush(&self) {}
     }
+}
 
-    /// The text of a message as written to the systemd journal.
-    struct JournalMessage<'a> {
-        crate_name: &'a str,
-        record: &'a Record<'a>,
-    }
+#[cfg(test)]
+mod tests {
+    use env_logger::fmt::style::{AnsiColor, Style};
+    use jiff::civil::{DateTime, date};
+    use log::{Level, Record};
 
-    impl fmt::Display for JournalMessage<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let level = self.record.level();
-            write!(f, "{level:<5} ")?;
-            if let Some(prefix) = module_prefix(self.crate_name, self.record.target()) {
-                write!(f, "{prefix} > ")?;
-            }
-            write!(f, "{}", self.record.args())
-        }
-    }
+    use super::{Message, StderrLine, module_prefix};
 
-    #[cfg(test)]
-    mod tests {
-        use log::{Level, Record};
-
-        use super::JournalMessage;
-
-        fn journal_message(level: Level, target: &str, text: &str) -> String {
-            JournalMessage {
+    fn stderr_line(
+        time: Option<DateTime>,
+        [level_style, path_style]: [Style; 2],
+        level: Level,
+        target: &str,
+        text: &str,
+    ) -> String {
+        StderrLine {
+            time,
+            message: Message {
                 crate_name: "app",
                 record: &Record::builder()
                     .level(level)
                     .target(target)
                     .args(format_args!("{text}"))
                     .build(),
-            }
-            .to_string()
+                level_style,
+                path_style,
+            },
         }
-
-        #[test]
-        fn journal_message_starts_with_the_padded_level() {
-            assert_eq!(
-                journal_message(Level::Info, "app", "started"),
-                "INFO  started"
-            );
-            assert_eq!(
-                journal_message(Level::Error, "reqwest::connect", "503\nbody"),
-                "ERROR reqwest::connect > 503\nbody",
-            );
-            assert_eq!(
-                journal_message(Level::Warn, "app::core", "slow"),
-                "WARN  core > slow",
-            );
-        }
+        .to_string()
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::module_prefix;
+    #[test]
+    fn message_starts_with_the_padded_level() {
+        let plain = |level, target, text| stderr_line(None, [Style::new(); 2], level, target, text);
+        assert_eq!(plain(Level::Info, "app", "started"), "INFO  started");
+        assert_eq!(
+            plain(Level::Error, "reqwest::connect", "503\nbody"),
+            "ERROR reqwest::connect > 503\nbody",
+        );
+        assert_eq!(plain(Level::Warn, "app::core", "slow"), "WARN  core > slow");
+    }
+
+    #[test]
+    fn stderr_line_starts_with_the_time_in_milliseconds() {
+        let time = date(2026, 11, 17).at(9, 5, 3, 42_000_000);
+        assert_eq!(
+            stderr_line(
+                Some(time),
+                [Style::new(); 2],
+                Level::Info,
+                "app::core",
+                "started"
+            ),
+            "2026-11-17 09:05:03.042 INFO  core > started",
+        );
+    }
+
+    #[test]
+    fn styles_wrap_the_level_and_the_module_path() {
+        let styles = [AnsiColor::Green.on_default(), Style::new().bold()];
+        assert_eq!(
+            stderr_line(None, styles, Level::Info, "app::core", "started"),
+            "\x1b[32mINFO \x1b[0m \x1b[1mcore\x1b[0m > started",
+        );
+    }
 
     #[test]
     fn module_prefix_is_relative_to_the_calling_crate() {
